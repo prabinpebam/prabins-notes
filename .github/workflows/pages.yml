@@ -1,0 +1,149 @@
+# Deploy app (D-87, D-48, D-98): deploys the released Focus Notes web app, at the version pinned
+# below, to this repository's own GitHub Pages, with the public notes in notes/ and, when the
+# private repository at private/ and the read-only deploy key PRIVATE_CONTENT_KEY are set up, the
+# private notes sealed as the vault. The leak check fails the deploy if any private text or file
+# name would reach the site (SEC-06).
+#
+# The bundle is checked against the SHA-256 below and against the release's GitHub artifact
+# attestation before anything in it runs, and every action is pinned by full commit SHA, because
+# this workflow holds your deploy key (SEC-05). Updates arrive as a pull request that changes
+# FOCUS_NOTES_VERSION and FOCUS_NOTES_SHA256 together; nothing changes until you merge it (DST-06).
+name: Deploy app
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # Nightly, so share links that expire stop opening without a push.
+  schedule:
+    - cron: "17 3 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: pages
+  cancel-in-progress: true
+env:
+  # PLACEHOLDER PIN: no release has a web app bundle yet (WP-5.5, WP-5.6). The release workflow
+  # replaces both values when it generates the template repository; until then the deploy refuses
+  # to run rather than download anything unchecked.
+  FOCUS_NOTES_VERSION: "0.0.0"
+  FOCUS_NOTES_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+  FOCUS_NOTES_SOURCE: prabinpebam/focus-notes
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      HAS_PRIVATE_KEY: ${{ secrets.PRIVATE_CONTENT_KEY != '' }}
+    steps:
+      - name: Refuse the placeholder pin
+        run: |
+          if [ "$FOCUS_NOTES_VERSION" = "0.0.0" ]; then
+            echo "::error::This workflow doesn't pin a released Focus Notes yet. Merge the update pull request, or copy pages.yml from the latest focus-notes-workspace."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so each public note's date is its last commit.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      # A third-party step, so it runs before private/ is checked out.
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Download the web app bundle
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bundle.tgz" \
+            "https://github.com/$FOCUS_NOTES_SOURCE/releases/download/v$FOCUS_NOTES_VERSION/focus-notes-web-$FOCUS_NOTES_VERSION.tgz"
+      - name: Check the bundle's SHA-256
+        run: echo "$FOCUS_NOTES_SHA256  $RUNNER_TEMP/bundle.tgz" | sha256sum --check --strict -
+      - name: Check the bundle's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify "$RUNNER_TEMP/bundle.tgz" --repo "$FOCUS_NOTES_SOURCE"
+      - name: Unpack the app
+        run: |
+          mkdir -p "$RUNNER_TEMP/bundle" _site
+          tar -xzf "$RUNNER_TEMP/bundle.tgz" -C "$RUNNER_TEMP/bundle"
+          cp -r "$RUNNER_TEMP/bundle/app/." _site/
+          touch _site/.nojekyll
+      # Only now, after every downloaded step, is private plaintext on the runner.
+      - name: Check out the private repository with the read-only deploy key
+        if: env.HAS_PRIVATE_KEY == 'true' && (github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+        env:
+          PRIVATE_CONTENT_KEY: ${{ secrets.PRIVATE_CONTENT_KEY }}
+        run: |
+          url=$(git config -f .gitmodules --get submodule.private.url || true)
+          if [ -z "$url" ]; then echo "::error::PRIVATE_CONTENT_KEY is set but there's no private submodule."; exit 1; fi
+          key="$RUNNER_TEMP/private_key"
+          trap 'rm -f "$key"' EXIT
+          umask 077 && printf '%s\n' "$PRIVATE_CONTENT_KEY" > "$key"
+          ssh_url=$(printf '%s' "$url" | sed -E 's#^https://github.com/#git@github.com:#')
+          git config submodule.private.url "$ssh_url"
+          # GitHub's published host key, pinned rather than scanned at run time.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts" \
+            git submodule update --init --depth 1 private
+          # Without the vault's grant (setup skipped it), the site has public notes only.
+          test -f private/access.json || echo "::notice::private/access.json isn't there yet, so this deploy has no vault."
+      - name: Publish the notes, seal the vault, and run the leak check
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          args="--site _site --notes notes --owner $OWNER --git"
+          if [ -d private ]; then args="$args --private private"; fi
+          node "$RUNNER_TEMP/bundle/publish/cli.mjs" publish $args
+          rm -rf private
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+          # Deleted by after-deploy once the deploy is done; a day at most if that ever fails.
+          retention-days: 1
+  deploy:
+    needs: build
+    # The default branch, whatever it's called. Scheduled runs always run there; their event
+    # carries repository.default_branch too (since 2022), so the schedule test is just the plainer of the two.
+    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+  # After the deploy, whatever its result: the artifact holds this build's keyrings and sealed files,
+  # and would stay downloadable from the run after a later deploy replaced them, so it's deleted. Then
+  # a nightly run fails on purpose if the repository is going quiet, after the deploy, not instead of it.
+  # So a failed deploy needs "Re-run all jobs", never "Re-run failed jobs": the artifact it needs is gone.
+  after-deploy:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      # Reading the last commit's date.
+      contents: read
+    steps:
+      - name: Delete this run's Pages artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[] | select(.name == "github-pages") | .id')
+          for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
+      - name: Check the repository is still active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GitHub turns off scheduled workflows after 60 days without activity; say so at 50.
+          last=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .commit.committer.date)
+          age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          if [ "$age" -ge 50 ]; then
+            echo "::error::No commit for $age days. GitHub stops nightly deploys at 60, so share links would stop expiring. Any commit resets this."
+            exit 1
+          fi
