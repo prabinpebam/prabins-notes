@@ -8,4 +8,8 @@ A traditional product development process takes a few months to build conviction
 
 It felt too proud to sit and assume only our team can sit and figure out the right user scenarios where the real world already made a product and started using it daily when we were still brainstorming.
 
-Claude code and OpenClaw are two such examples. Never meant for the masses but the coders they were meant for in the beginning cant's be prevented from using it like normal humans to do normal human things as they happen to be also humans. All of the mainstream use cases were organically defined and discovered by them.&#x20;
+Claude code and OpenClaw are two such examples. Never meant for the masses but the coders they were meant for in the beginning cant's be prevented from using it like normal humans, to do normal human things as they also happen to be humans. All of the mainstream use cases were organically defined and discovered by them.
+
+This raises a new meaning to the phrase "Design by democracy". I've always been so much against this idea but I'm beginning to see a way to let the users lead us where they want to go.
+
+I don't know what the new process is but I'm open and observing to figure out how to leverage this phenomenon rather than fight it.
