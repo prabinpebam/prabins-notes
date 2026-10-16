@@ -1,1 +1,0 @@
-# Democratized designi
