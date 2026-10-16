@@ -1,3 +1,0 @@
-# Democratized designing
-
-M
