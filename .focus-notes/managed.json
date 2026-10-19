@@ -1,0 +1,9 @@
+{
+  "managed": [
+    ".focus-notes/app.json",
+    ".focus-notes/managed.json",
+    ".github/focus-notes/update.mjs",
+    ".github/workflows/pages.yml",
+    ".github/workflows/update.yml"
+  ]
+}

@@ -4,10 +4,12 @@
 # private notes sealed as the vault. The leak check fails the deploy if any private text or file
 # name would reach the site (SEC-06).
 #
-# The bundle is checked against the SHA-256 below and against the release's GitHub artifact
-# attestation before anything in it runs, and every action is pinned by full commit SHA, because
-# this workflow holds your deploy key (SEC-05). Updates arrive as a pull request that changes
-# FOCUS_NOTES_VERSION and FOCUS_NOTES_SHA256 together; nothing changes until you merge it (DST-06).
+# The release to deploy is pinned in .focus-notes/app.json, a version and the bundle's SHA-256. The
+# bundle is checked against that SHA-256 and against the release's GitHub artifact attestation
+# before anything in it runs, and every action is pinned by full commit SHA, because this workflow
+# holds your deploy key (SEC-05). The pin lives outside this file so the Update app workflow can
+# propose a new one with its own token, which may not edit workflows (D-137). Updates arrive as a
+# pull request that changes both values together; nothing changes until you merge it (DST-06).
 name: Deploy app
 on:
   push:
@@ -22,12 +24,9 @@ concurrency:
   group: pages
   cancel-in-progress: true
 env:
-  # PLACEHOLDER PIN: no release has a web app bundle yet (WP-5.5, WP-5.6). The release workflow
-  # replaces both values when it generates the template repository; until then the deploy refuses
-  # to run rather than download anything unchecked.
-  FOCUS_NOTES_VERSION: "0.0.0"
-  FOCUS_NOTES_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
   FOCUS_NOTES_SOURCE: prabinpebam/focus-notes
+  # No pin below this deploys: the template raises it when an older release must never run again.
+  FOCUS_NOTES_MIN_VERSION: "0.0.1"
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -37,32 +36,60 @@ jobs:
     env:
       HAS_PRIVATE_KEY: ${{ secrets.PRIVATE_CONTENT_KEY != '' }}
     steps:
-      - name: Refuse the placeholder pin
-        run: |
-          if [ "$FOCUS_NOTES_VERSION" = "0.0.0" ]; then
-            echo "::error::This workflow doesn't pin a released Focus Notes yet. Merge the update pull request, or copy pages.yml from the latest focus-notes-workspace."
-            exit 1
-          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history, so each public note's date is its last commit.
           fetch-depth: 0
           persist-credentials: false
+      # The placeholder pin (0.0.0) means no release is pinned yet: the deploy refuses to run rather
+      # than download anything unchecked. Each value must match its pattern whole, newlines and all.
+      - name: Read the pinned release, and refuse the placeholder
+        run: |
+          version=$(jq -er '.version | strings' .focus-notes/app.json)
+          sha256=$(jq -er '.sha256 | strings' .focus-notes/app.json)
+          re_version='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          re_sha256='^[0-9a-f]{64}$'
+          if ! [[ $version =~ $re_version && $sha256 =~ $re_sha256 ]]; then
+            echo "::error::.focus-notes/app.json needs a version and a SHA-256."
+            exit 1
+          fi
+          if [ "$version" = "0.0.0" ]; then
+            echo "::error::No released Focus Notes is pinned yet. Merge the Update app pull request, or run Actions -> Update app."
+            exit 1
+          fi
+          # Compares the x.y.z parts; at the minimum itself, a suffixed pin (-beta) comes before it.
+          core=${version%%-*}
+          min_core=${FOCUS_NOTES_MIN_VERSION%%-*}
+          lowest=$(printf '%s\n%s\n' "$min_core" "$core" | sort -V | head -n 1)
+          if [ "$lowest" != "$min_core" ] || { [ "$core" = "$min_core" ] && [ "$version" != "$core" ] && [ "$FOCUS_NOTES_MIN_VERSION" = "$min_core" ]; }; then
+            echo "::error::.focus-notes/app.json pins a release below $FOCUS_NOTES_MIN_VERSION, which must not deploy. Run Actions -> Update app."
+            exit 1
+          fi
+          # A pull request that moved the pin may ask for this file to be copied by hand.
+          expected=$(jq -r '.workflows[".github/workflows/pages.yml"] // empty' .focus-notes/app.json)
+          actual=$(sha256sum .github/workflows/pages.yml | cut -d ' ' -f 1)
+          if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+            echo "::warning::.github/workflows/pages.yml isn't the version this release expects. Copy it from the update pull request's list."
+          fi
+          { echo "FOCUS_NOTES_VERSION=$version"; echo "FOCUS_NOTES_SHA256=$sha256"; } >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      # A third-party step, so it runs before private/ is checked out.
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      # A third-party step, so it runs before private/ is checked out. Its base_url is the site's
+      # address, for public pages' canonical links.
+      - id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: Download the web app bundle
         run: |
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/bundle.tgz" \
             "https://github.com/$FOCUS_NOTES_SOURCE/releases/download/v$FOCUS_NOTES_VERSION/focus-notes-web-$FOCUS_NOTES_VERSION.tgz"
       - name: Check the bundle's SHA-256
         run: echo "$FOCUS_NOTES_SHA256  $RUNNER_TEMP/bundle.tgz" | sha256sum --check --strict -
+      # Made by the source's release workflow, for exactly this version's tag (D-128).
       - name: Check the bundle's attestation
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify "$RUNNER_TEMP/bundle.tgz" --repo "$FOCUS_NOTES_SOURCE"
+        run: gh attestation verify "$RUNNER_TEMP/bundle.tgz" --repo "$FOCUS_NOTES_SOURCE" --cert-identity "https://github.com/$FOCUS_NOTES_SOURCE/.github/workflows/release.yml@refs/tags/v$FOCUS_NOTES_VERSION" --source-ref "refs/tags/v$FOCUS_NOTES_VERSION" --deny-self-hosted-runners
       - name: Unpack the app
         run: |
           mkdir -p "$RUNNER_TEMP/bundle" _site
@@ -88,11 +115,13 @@ jobs:
             git submodule update --init --depth 1 private
           # Without the vault's grant (setup skipped it), the site has public notes only.
           test -f private/access.json || echo "::notice::private/access.json isn't there yet, so this deploy has no vault."
-      - name: Publish the notes, seal the vault, and run the leak check
+      - name: Publish the notes and their pages, seal the vault, and run the leak check
         env:
           OWNER: ${{ github.repository_owner }}
+          SITE_URL: ${{ steps.pages.outputs.base_url }}
         run: |
-          args="--site _site --notes notes --owner $OWNER --git"
+          # The bundle's publish/ holds the publisher and the page renderer it renders public pages with.
+          args="--site _site --notes notes --owner $OWNER --git --reader $RUNNER_TEMP/bundle/publish --site-url $SITE_URL/"
           if [ -d private ]; then args="$args --private private"; fi
           node "$RUNNER_TEMP/bundle/publish/cli.mjs" publish $args
           rm -rf private

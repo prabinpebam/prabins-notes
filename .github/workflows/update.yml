@@ -1,0 +1,139 @@
+# Update app (DST-06, D-137): once a week, looks for a newer Focus Notes release and, if there is
+# one, opens a pull request that moves .focus-notes/app.json (the version and the bundle's SHA-256
+# that Deploy app deploys) and the other template-managed files in .focus-notes/managed.json. It
+# never touches notes/ or private/. Nothing changes until you review and merge the pull request.
+#
+# The release's bundle and template are checked against its SHA256SUMS and its attestation, made by
+# the release workflow for that exact tag on a GitHub-hosted runner, before anything from them is
+# used; the template is read in memory, never unpacked. A release is taken only once it's been out
+# for 3 days, unless you run this by hand with "skip the wait". There's only ever one update pull
+# request, from the focus-notes/update branch; a newer release moves it, and a version whose pull
+# request you closed is skipped. Workflow files (this one and pages.yml) can't be changed with the
+# workflow's own token, so the pull request says "action needed" and lists them, with the SHA-256
+# each should have, for you to copy by hand.
+#
+# Kill switch: deleting a release (or its files) withdraws it. Instances stop being offered it, and
+# a Deploy app pinned to it fails safe at the download, leaving the site as it was.
+#
+# Trade-off: opening the pull request needs Settings -> Actions -> General -> "Allow GitHub Actions
+# to create and approve pull requests". That lets any workflow here with pull-requests: write open
+# and approve pull requests, which matters if you require reviews before merging. Leave it off and
+# this still pushes the focus-notes/update branch and puts a link to open the pull request yourself
+# in the run's summary.
+name: Update app
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      skip-wait:
+        description: Take a release less than 3 days old
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: update-app
+  cancel-in-progress: false
+env:
+  FOCUS_NOTES_SOURCE: prabinpebam/focus-notes
+jobs:
+  check:
+    # The template repository itself is published from releases; it doesn't update itself.
+    if: github.repository != 'prabinpebam/focus-notes-workspace'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - id: latest
+        name: Find the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKIP_WAIT: ${{ inputs.skip-wait }}
+        run: |
+          gh api "repos/$FOCUS_NOTES_SOURCE/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          node .github/focus-notes/update.mjs latest "$RUNNER_TEMP/releases.json" >> "$GITHUB_OUTPUT"
+      - name: Download its bundle, template and checksums
+        if: steps.latest.outputs.version != ''
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          for f in "focus-notes-web-$VERSION.tgz" "focus-notes-workspace-$VERSION.tgz" SHA256SUMS; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/release/$f" "https://github.com/$FOCUS_NOTES_SOURCE/releases/download/v$VERSION/$f"
+          done
+      - name: Check their SHA-256
+        if: steps.latest.outputs.version != ''
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          : > checked.sums
+          for f in "focus-notes-web-$VERSION.tgz" "focus-notes-workspace-$VERSION.tgz"; do
+            # Each name exactly once, so it's never ambiguous which line counts.
+            test "$(awk -v n="$f" '$2 == n' SHA256SUMS | wc -l)" -eq 1
+            awk -v n="$f" '$2 == n' SHA256SUMS >> checked.sums
+          done
+          sha256sum --check --strict checked.sums
+      # Made by the source's release workflow, for exactly this version's tag (D-128).
+      - name: Check their attestations
+        if: steps.latest.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          for f in "focus-notes-web-$VERSION.tgz" "focus-notes-workspace-$VERSION.tgz"; do
+            gh attestation verify "$RUNNER_TEMP/release/$f" --repo "$FOCUS_NOTES_SOURCE" --cert-identity "https://github.com/$FOCUS_NOTES_SOURCE/.github/workflows/release.yml@refs/tags/v$VERSION" --source-ref "refs/tags/v$VERSION" --deny-self-hosted-runners
+          done
+      - name: Plan the update
+        if: steps.latest.outputs.version != ''
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          node .github/focus-notes/update.mjs plan --version "$VERSION" --template "$RUNNER_TEMP/release/focus-notes-workspace-$VERSION.tgz" --bundle "$RUNNER_TEMP/release/focus-notes-web-$VERSION.tgz" --out "$RUNNER_TEMP/update"
+      - if: steps.latest.outputs.version != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: update
+          path: ${{ runner.temp }}/update/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  # The only job that can write, and only from the default branch: it commits the checked files to
+  # the focus-notes/update branch and opens or updates the one pull request. It never merges.
+  pull-request:
+    needs: check
+    if: needs.check.outputs.version != '' && (github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: update
+          path: ${{ runner.temp }}/update
+      - name: Open or update the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/focus-notes/update.mjs open --plan "$RUNNER_TEMP/update"
