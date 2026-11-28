@@ -1,0 +1,3 @@
+# Rice pudding
+
+To make rice pudding, we need half a cup of rice, four cups of milk, four tablespoons of sugar, a pinch of cardamom powder, and some chopped nuts and raisins. First, wash the rice thoroughly with clean water. Pour the milk into a large pot and bring it to a boil. Add the washed rice to the boiling milk and stir well. Cook the rice on low heat for about 30 to 40 minutes, stirring often so that the milk does not stick to the bottom of the pot. When the rice becomes soft and the pudding thickens, add the sugar and cardamom powder. Stir everything well and cook for another five minutes. Turn off the heat and garnish the rice pudding with chopped nuts and raisins. Let the pudding cool a little before serving. You can enjoy it warm or chilled.
